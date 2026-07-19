@@ -1,0 +1,6 @@
+d6c89960c8d37fb0add2814dfe06e2acb3a291585d9e496f3e389f4576b329d2  scripts/multi-section-patch-darwin-amd64
+666edc4a932d47585f4fab21c06b42e1c83bfe320a00551e919bb8146ee6b1b5  scripts/multi-section-patch-darwin-arm64
+7ea2258d2c0ab0db1ee1d496da0ff72b4bcfd76b13faaa6ead271e358d35b648  scripts/multi-section-patch-linux-amd64
+2ecaca513bd51f992022ae43dda6343b4d8b41c375356fe5e89effbfb9995f24  scripts/multi-section-patch-linux-arm64
+b03c4ad199ba062cecc89b7ade341765e0a8b30f96466a48ae783b126250ea93  scripts/multi-section-patch-windows-amd64.exe
+0e0a6089406c908c3025424c5a60a4e51bf71e26616d84520a579801f763331e  scripts/multi-section-patch-windows-arm64.exe

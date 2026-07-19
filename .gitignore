@@ -1,0 +1,9 @@
+.DS_Store
+Thumbs.db
+
+bin/
+dist/
+coverage.out
+*.test
+
+.multi-section-patch-backup-*/
