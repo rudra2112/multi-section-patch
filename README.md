@@ -111,9 +111,9 @@ section and the "Install with npx skills" section from README.md.
 Return the resolved ranges and SHA-256 digests.
 ```
 
-The repository is public and can be installed now. It does not yet have a
-tagged release, so an unpinned remote install currently resolves the default
-branch. After releases begin, pin a reviewed tag for repeatable installations.
+The repository is public and can be installed now. An unpinned remote install
+resolves the latest tagged release when available, then falls back to the
+default branch. Pin a reviewed tag or commit for repeatable installations.
 
 ## Why use Multi Section Patch?
 
@@ -250,7 +250,7 @@ For example, on an Apple-silicon Mac:
 chmod +x <skill-directory>/scripts/multi-section-patch-darwin-arm64
 ```
 
-After the first tagged release, prefer its source archive from
+For repeatable manual installations, prefer a tagged source archive from
 [GitHub Releases](https://github.com/rudra2112/multi-section-patch/releases)
 over a moving branch.
 
@@ -617,7 +617,7 @@ the destination printed by `gh skill install`. To uninstall, delete only that
 exact `multi-section-patch` directory, never its shared parent skills
 directory.
 
-After a release exists, install a reviewed version with:
+Install a reviewed tagged version with:
 
 ```text
 gh skill install rudra2112/multi-section-patch multi-section-patch --agent codex --scope user --pin <tag>
