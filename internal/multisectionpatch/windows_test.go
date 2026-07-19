@@ -88,7 +88,7 @@ func TestWindowsEditRejectsExclusivelyOpenedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if code != 1 || stdout != "" {
+	if code != 1 || !strings.Contains(stdout, "-one\n+ONE\n") {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
 	}
 	if !strings.Contains(stderr, "cannot") {
