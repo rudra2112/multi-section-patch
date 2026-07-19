@@ -114,6 +114,49 @@ func TestReadReportsInvalidRegexWithoutTrace(t *testing.T) {
 	}
 }
 
+func TestReadRegexAnchorsMatchLogicalLines(t *testing.T) {
+	for name, newline := range map[string]string{
+		"LF":   "\n",
+		"CRLF": "\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "sample.txt")
+			writeTestFile(t, target, strings.Join(
+				[]string{"alpha", "BEGIN", "body", "END", "omega", ""},
+				newline,
+			))
+			spec, err := json.Marshal(map[string]any{
+				"sections": []map[string]any{{
+					"file":        target,
+					"start_regex": "^BEGIN$",
+					"end_regex":   "^END$",
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, stdout, stderr := invoke([]string{"read", "--json"}, string(spec))
+
+			if code != 0 {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			var payload struct {
+				Sections []struct {
+					Content string `json:"content"`
+				} `json:"sections"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+				t.Fatal(err)
+			}
+			want := "BEGIN" + newline + "body" + newline
+			if len(payload.Sections) != 1 || payload.Sections[0].Content != want {
+				t.Fatalf("unexpected payload: %#v", payload)
+			}
+		})
+	}
+}
+
 func TestReadTreatsJSONMarkersAsLiteral(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "sample.txt")
 	writeTestFile(t, target, "aab\n/a+b/\ntail\n")

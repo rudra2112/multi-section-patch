@@ -52,6 +52,8 @@ func unifiedDiff(plan *filePlan) string {
 	return output.String()
 }
 
+// plannedDiffLines builds an ordered diff stream from already-sorted,
+// non-overlapping edits while retaining every untouched line.
 func plannedDiffLines(plan *filePlan) []diffLine {
 	lines := make([]diffLine, 0, len(plan.lines))
 	cursor := 0
@@ -82,6 +84,8 @@ func plannedDiffLines(plan *filePlan) []diffLine {
 	return lines
 }
 
+// diffLinesMatchPlan reconstructs both file versions from a proposed diff
+// stream and accepts it only when the exact bytes and line boundaries match.
 func diffLinesMatchPlan(lines []diffLine, plan *filePlan) bool {
 	if !diffStreamHasValidLineBoundaries(lines, '+') ||
 		!diffStreamHasValidLineBoundaries(lines, '-') {
@@ -117,6 +121,8 @@ func diffStreamHasValidLineBoundaries(lines []diffLine, excludedPrefix byte) boo
 	return true
 }
 
+// fallbackDiffLines builds an exact coarse diff by preserving the common line
+// prefix and suffix and replacing the entire differing middle.
 func fallbackDiffLines(original, updated string) []diffLine {
 	oldLines := splitLines(original)
 	newLines := splitLines(updated)
@@ -149,6 +155,8 @@ func fallbackDiffLines(original, updated string) []diffLine {
 	return lines
 }
 
+// diffHunks groups changes separated by at most twice the requested context
+// and expands each group with nearby lines for unified-diff output.
 func diffHunks(lines []diffLine, context int) []diffHunk {
 	type changeGroup struct {
 		first int
@@ -193,6 +201,8 @@ func diffHunks(lines []diffLine, context int) []diffHunk {
 	return hunks
 }
 
+// writeDiffHunk calculates old and new range sizes, writes one unified-diff
+// hunk, and returns the next source and destination line positions.
 func writeDiffHunk(
 	output *strings.Builder,
 	lines []diffLine,
@@ -220,6 +230,8 @@ func writeDiffHunk(
 	return oldLine + oldCount, newLine + newCount
 }
 
+// formatDiffRange emits unified-diff range syntax, including the special
+// zero-length position and the compact one-line form.
 func formatDiffRange(start, count int) string {
 	switch count {
 	case 0:
@@ -231,6 +243,8 @@ func formatDiffRange(start, count int) string {
 	}
 }
 
+// writeDiffLine escapes unsafe control text and appends the standard marker
+// when the source line has no terminating newline.
 func writeDiffLine(output *strings.Builder, prefix, line string) {
 	output.WriteString(prefix)
 	output.WriteString(escapeControlText(line))

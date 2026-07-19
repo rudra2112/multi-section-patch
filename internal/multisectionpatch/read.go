@@ -22,10 +22,13 @@ type section struct {
 	lines []string
 }
 
+// content joins the section's zero-based half-open line range without changing
+// the original line terminators.
 func (s section) content() string {
 	return strings.Join(s.lines[s.start:s.end], "")
 }
 
+// digest returns the lowercase SHA-256 digest of the exact selected content.
 func (s section) digest() string {
 	sum := sha256.Sum256([]byte(s.content()))
 	return hex.EncodeToString(sum[:])
@@ -40,6 +43,8 @@ type readOptions struct {
 	readFromSpec bool
 }
 
+// runRead parses and resolves every requested section before emitting human or
+// JSON output, preventing a later invalid selector from producing partial data.
 func runRead(args []string, stdin io.Reader, stdout io.Writer) error {
 	options, err := parseReadOptions(args)
 	if err != nil {
@@ -121,6 +126,8 @@ func runRead(args []string, stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
+// parseReadOptions separates read flags from inline selectors, defaults to
+// numbered human output, and falls back to specification input when needed.
 func parseReadOptions(args []string) (readOptions, error) {
 	options := readOptions{lineNumbers: true}
 	for index := 0; index < len(args); index++ {
@@ -165,6 +172,8 @@ func parseReadOptions(args []string) (readOptions, error) {
 	return options, nil
 }
 
+// parseSelector converts an inline file selector into numeric, literal-marker,
+// or regular-expression fields using the final @ as the file separator.
 func parseSelector(selector string) (sectionItem, error) {
 	if _, err := os.Stat(selector); err == nil {
 		return sectionItem{File: selector}, nil
@@ -213,6 +222,8 @@ func parseSelector(selector string) (sectionItem, error) {
 	return item, nil
 }
 
+// inlinePattern treats a slash-delimited value as a regular expression and
+// every other value as a literal line marker.
 func inlinePattern(value string) (literal, regex *string) {
 	if len(value) >= 2 && strings.HasPrefix(value, "/") && strings.HasSuffix(value, "/") {
 		unwrapped := value[1 : len(value)-1]
@@ -221,6 +232,8 @@ func inlinePattern(value string) (literal, regex *string) {
 	return &value, nil
 }
 
+// resolveSection reads and validates a file, resolves the requested line
+// bounds, and records the display name alongside the original line data.
 func resolveSection(item sectionItem) (section, error) {
 	path, data, err := readTextFile(item.File)
 	if err != nil {
@@ -238,6 +251,8 @@ func resolveSection(item sectionItem) (section, error) {
 	return section{path: path, name: name, start: start, end: end, lines: lines}, nil
 }
 
+// readTextFile resolves symlinks to a canonical path, verifies the opened
+// target is a regular file, and returns validated UTF-8 text bytes.
 func readTextFile(name string) (string, []byte, error) {
 	absolute, err := filepath.Abs(name)
 	if err != nil {
@@ -282,6 +297,8 @@ func readTextFile(name string) (string, []byte, error) {
 	return path, data, nil
 }
 
+// sectionRange validates a selector and resolves it to a zero-based half-open
+// range, applying marker occurrence and inclusion options when configured.
 func sectionRange(item sectionItem, lines []string) (int, int, error) {
 	if err := validateSelectorFields(item); err != nil {
 		return 0, 0, err
@@ -354,6 +371,8 @@ type linePattern struct {
 	regex bool
 }
 
+// itemStartPattern returns the configured regular-expression or literal start
+// marker and reports whether a start bound exists.
 func itemStartPattern(item sectionItem) (linePattern, bool) {
 	if item.StartRegex != nil {
 		return linePattern{text: *item.StartRegex, regex: true}, true
@@ -364,6 +383,8 @@ func itemStartPattern(item sectionItem) (linePattern, bool) {
 	return linePattern{}, false
 }
 
+// itemEndPattern returns the configured regular-expression or literal end
+// marker and reports whether an end bound exists.
 func itemEndPattern(item sectionItem) (linePattern, bool) {
 	if item.EndRegex != nil {
 		return linePattern{text: *item.EndRegex, regex: true}, true
@@ -374,6 +395,8 @@ func itemEndPattern(item sectionItem) (linePattern, bool) {
 	return linePattern{}, false
 }
 
+// validateSelectorFields rejects mixed selector families and marker-only
+// options that have no literal or regular-expression marker to modify.
 func validateSelectorFields(item sectionItem) error {
 	numeric := item.StartLine != nil || item.EndLine != nil
 	literal := item.Start != nil || item.End != nil
@@ -397,6 +420,8 @@ func validateSelectorFields(item sectionItem) error {
 	return nil
 }
 
+// itemName returns the user-facing section name, falling back to its file path
+// and then a generic label for diagnostics.
 func itemName(item sectionItem) string {
 	if item.Name != "" {
 		return item.Name
@@ -407,6 +432,8 @@ func itemName(item sectionItem) string {
 	return "section"
 }
 
+// occurrenceValue defaults an omitted marker occurrence to one and rejects
+// non-positive counts.
 func occurrenceValue(name string, value *int) (int, error) {
 	if value == nil {
 		return 1, nil
@@ -417,6 +444,8 @@ func occurrenceValue(name string, value *int) (int, error) {
 	return *value, nil
 }
 
+// findLine scans from start for the requested occurrence, using substring
+// matching for literals or one compiled RE2 expression over logical line text.
 func findLine(lines []string, pattern linePattern, start, occurrence int) (int, error) {
 	text := pattern.text
 	var compiled *regexp.Regexp
@@ -431,7 +460,8 @@ func findLine(lines []string, pattern linePattern, start, occurrence int) (int, 
 	for index := start; index < len(lines); index++ {
 		matched := strings.Contains(lines[index], text)
 		if compiled != nil {
-			matched = compiled.MatchString(lines[index])
+			line := strings.TrimSuffix(strings.TrimSuffix(lines[index], "\n"), "\r")
+			matched = compiled.MatchString(line)
 		}
 		if matched {
 			count++
@@ -447,6 +477,8 @@ func findLine(lines []string, pattern linePattern, start, occurrence int) (int, 
 	return 0, fmt.Errorf("%s pattern not found after line %d: %s", kind, start+1, text)
 }
 
+// writeSectionsJSON serializes resolved ranges, exact content, and digests as
+// stable indented JSON without HTML escaping.
 func writeSectionsJSON(writer io.Writer, sections []section) error {
 	type result struct {
 		File      string `json:"file"`
@@ -476,6 +508,8 @@ func writeSectionsJSON(writer io.Writer, sections []section) error {
 	return encoder.Encode(payload)
 }
 
+// displayRange converts a zero-based half-open range into one-based inclusive
+// line numbers, representing an empty file as 1:0.
 func displayRange(selected section) (int, int) {
 	if len(selected.lines) == 0 {
 		return 1, 0

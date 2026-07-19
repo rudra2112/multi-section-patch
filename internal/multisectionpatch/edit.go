@@ -34,6 +34,8 @@ type filePlan struct {
 	updated  []byte
 }
 
+// runEdit validates and plans the complete request, emits its diff by default,
+// and invokes the guarded apply pipeline only when --apply is present.
 func runEdit(args []string, stdin io.Reader, stdout io.Writer) error {
 	options, err := parseEditOptions(args)
 	if err != nil {
@@ -130,6 +132,8 @@ func runEdit(args []string, stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
+// parseEditOptions recognizes the edit subcommand's specification, apply,
+// backup, and JSON flags and rejects every unknown argument.
 func parseEditOptions(args []string) (editOptions, error) {
 	var options editOptions
 	for index := 0; index < len(args); index++ {
@@ -153,6 +157,8 @@ func parseEditOptions(args []string) (editOptions, error) {
 	return options, nil
 }
 
+// planEdits snapshots each target by filesystem identity, validates selectors
+// and guards, groups edits per file, and computes the final bytes before writes.
 func planEdits(items []sectionItem) ([]*filePlan, error) {
 	plans := make([]*filePlan, 0)
 	plansByIdentity := make(map[string]*filePlan)
@@ -239,6 +245,8 @@ func planEdits(items []sectionItem) ([]*filePlan, error) {
 	return plans, nil
 }
 
+// replacementText returns an inline replacement or reads and validates the
+// replacement file through the same text-file path used by section reads.
 func replacementText(item sectionItem) (string, error) {
 	if item.Replacement != nil {
 		return *item.Replacement, nil
@@ -250,6 +258,8 @@ func replacementText(item sectionItem) (string, error) {
 	return string(data), nil
 }
 
+// normalizeNewlines converts CRLF sequences in replacement text to LF, then
+// converts LF to CRLF when the target uses CRLF line endings.
 func normalizeNewlines(replacement, original string) string {
 	replacement = strings.ReplaceAll(replacement, "\r\n", "\n")
 	if strings.Contains(original, "\r\n") {
@@ -258,6 +268,8 @@ func normalizeNewlines(replacement, original string) string {
 	return replacement
 }
 
+// finishPlan sorts and rejects overlapping edits, streams replacements between
+// untouched lines, and preserves the target's final-newline state.
 func finishPlan(plan *filePlan) error {
 	sort.Slice(plan.edits, func(left, right int) bool {
 		return plan.edits[left].section.start < plan.edits[right].section.start
@@ -290,7 +302,8 @@ func finishPlan(plan *filePlan) error {
 	return nil
 }
 
-// preserveFinalNewline keeps the file-level newline invariant when an edit reaches EOF.
+// preserveFinalNewline adds or removes trailing LF or CRLF bytes so non-empty
+// output retains the original final-newline state; fully deleted files stay empty.
 func preserveFinalNewline(original, updated []byte) []byte {
 	originalHasFinalNewline := bytes.HasSuffix(original, []byte("\n"))
 	updatedHasFinalNewline := bytes.HasSuffix(updated, []byte("\n"))
@@ -311,6 +324,8 @@ func preserveFinalNewline(original, updated []byte) []byte {
 	return updated
 }
 
+// changedPlans filters out byte-identical plans so dry runs and the apply
+// pipeline operate only on files whose content would actually change.
 func changedPlans(plans []*filePlan) []*filePlan {
 	changed := make([]*filePlan, 0, len(plans))
 	for _, plan := range plans {
@@ -321,6 +336,8 @@ func changedPlans(plans []*filePlan) []*filePlan {
 	return changed
 }
 
+// writeEditJSON serializes the generated diffs, changed-file count, apply
+// status, and optional backup directory as indented JSON.
 func writeEditJSON(
 	writer io.Writer,
 	diffs []string,

@@ -19,6 +19,8 @@ func fileIdentityAndLinks(_ *os.File, info os.FileInfo) (string, uint64, error) 
 	return identity, uint64(stat.Nlink), nil
 }
 
+// validateTargetForEdit adds no Unix-specific preflight because the shared
+// snapshot, staging, permission, and replacement checks cover these targets.
 func validateTargetForEdit(_ string, _ os.FileInfo) error {
 	return nil
 }

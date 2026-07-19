@@ -21,6 +21,8 @@ type fileSnapshot struct {
 	data     []byte
 }
 
+// readFileSnapshot resolves a regular text file and captures its identity,
+// hard-link count, metadata, and validated bytes from the same open handle.
 func readFileSnapshot(name string) (fileSnapshot, error) {
 	absolute, err := filepath.Abs(name)
 	if err != nil {
@@ -87,10 +89,15 @@ type stagedPlan struct {
 	preserveRecovery    bool
 }
 
+// applyPlans applies plans with optional backups through the guarded staging
+// and rollback path when the caller does not need the backup location reported.
 func applyPlans(plans []*filePlan, backup bool, replace func(string, string) error) error {
 	return applyPlansWithBackupReport(plans, backup, replace, nil)
 }
 
+// applyPlansWithBackupReport stages every replacement and recovery file before
+// replacing any target, revalidates targets, then replaces sequentially with
+// guarded rollback.
 func applyPlansWithBackupReport(
 	plans []*filePlan,
 	backup bool,
@@ -172,6 +179,8 @@ func applyPlansWithBackupReport(
 	return nil
 }
 
+// stageBytes writes, sets permissions on, syncs, and identifies a single-link
+// temporary file beside its target so replacement stays on one filesystem.
 func stageBytes(
 	target string,
 	purpose string,
@@ -243,6 +252,8 @@ func removeTemporary(result error, path string) error {
 	)
 }
 
+// verifyPlansUnchanged re-snapshots every planned target and stops at the first
+// identity, link-count, permission, or content mismatch.
 func verifyPlansUnchanged(plans []*filePlan) error {
 	for _, plan := range plans {
 		if err := verifyPlanUnchanged(plan); err != nil {
@@ -252,6 +263,8 @@ func verifyPlansUnchanged(plans []*filePlan) error {
 	return nil
 }
 
+// verifyPlanUnchanged rejects a target whose identity, hard-link state,
+// permissions, or bytes no longer match its planning snapshot.
 func verifyPlanUnchanged(plan *filePlan) error {
 	snapshot, err := readFileSnapshot(plan.path)
 	if err != nil {
@@ -266,6 +279,9 @@ func verifyPlanUnchanged(plan *filePlan) error {
 	return nil
 }
 
+// rollbackResult visits applied plans in reverse order and restores originals
+// only while the expected replacement remains untouched, retaining recovery
+// files rather than overwriting concurrent changes.
 func rollbackResult(cause error, applied []*stagedPlan, replace func(string, string) error) error {
 	if len(applied) == 0 {
 		return cause
@@ -338,6 +354,9 @@ func rollbackResult(cause error, applied []*stagedPlan, replace func(string, str
 	)
 }
 
+// backUpPlans writes each original plus a checksum-and-mode manifest into a new
+// timestamped directory and returns its absolute path. A failure may retain the
+// partially populated directory for diagnosis and manual recovery.
 func backUpPlans(plans []*filePlan) (string, error) {
 	prefix := ".multi-section-patch-backup-" + time.Now().UTC().Format("20060102-150405-")
 	root, err := os.MkdirTemp(".", prefix)

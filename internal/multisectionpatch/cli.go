@@ -11,6 +11,8 @@ import (
 
 type stringList []string
 
+// UnmarshalJSON accepts either one string or a list of strings and rejects
+// null or non-string values before they reach edit guards.
 func (values *stringList) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return errors.New("must_contain cannot be null")
@@ -58,8 +60,9 @@ type sectionItem struct {
 	MustContain     stringList `json:"must_contain"`
 }
 
-// Run executes the Multi Section Patch CLI and returns a process-style exit
-// code.
+// Run dispatches the requested subcommand, writes sanitized diagnostics to
+// stderr, and returns 0 for success, 1 for subcommand errors, or 2 when the
+// subcommand is missing or unknown.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "Usage: multi-section-patch read ... | multi-section-patch edit ...")
@@ -83,6 +86,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// loadSpecData reads a named specification file or standard input, requiring
+// non-blank input when no file path is supplied.
 func loadSpecData(path string, stdin io.Reader) ([]byte, error) {
 	if path != "" && path != "-" {
 		data, err := os.ReadFile(path)
@@ -101,6 +106,9 @@ func loadSpecData(path string, stdin io.Reader) ([]byte, error) {
 	return data, nil
 }
 
+// decodeSectionItems accepts a bare list or a keyed specification object,
+// validates its shape strictly, and converts selector strings or objects into
+// section items.
 func decodeSectionItems(data []byte, key string) ([]sectionItem, error) {
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return nil, errors.New("spec cannot be null")
