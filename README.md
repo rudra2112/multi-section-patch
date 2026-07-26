@@ -87,7 +87,7 @@ agent.
 ### Install with GitHub CLI
 
 This is the simplest user-wide installation when
-[GitHub CLI](https://cli.github.com/) 2.91.0 or newer is available. The
+[GitHub CLI](https://cli.github.com/) 2.94.0 or newer is available. The
 `gh skill` commands are currently a public preview.
 
 Preview the files before trusting them:
