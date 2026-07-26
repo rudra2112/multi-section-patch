@@ -18,7 +18,10 @@ func BenchmarkReadSizeDoubling(b *testing.B) {
 		b.Run(fmt.Sprintf("lines-%d", lineCount), func(b *testing.B) {
 			b.SetBytes(int64(len(content)))
 			for iteration := 0; iteration < b.N; iteration++ {
-				if _, err := resolveSection(sectionItem{File: path}); err != nil {
+				if _, err := resolveSection(
+					sectionItem{File: path},
+					newFileSnapshotCache(),
+				); err != nil {
 					b.Fatal(err)
 				}
 			}

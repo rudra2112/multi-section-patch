@@ -21,18 +21,67 @@ type fileSnapshot struct {
 	data     []byte
 }
 
-// readFileSnapshot resolves a regular text file and captures its identity,
-// hard-link count, metadata, and validated bytes from the same open handle.
-func readFileSnapshot(name string) (fileSnapshot, error) {
+// fileSnapshotCache keeps one validated view of each canonical file during a
+// single read or edit-planning command.
+type fileSnapshotCache struct {
+	byPath     map[string]fileSnapshot
+	byIdentity map[string]fileSnapshot
+}
+
+// newFileSnapshotCache creates an empty request-local snapshot cache.
+func newFileSnapshotCache() *fileSnapshotCache {
+	return &fileSnapshotCache{
+		byPath:     make(map[string]fileSnapshot),
+		byIdentity: make(map[string]fileSnapshot),
+	}
+}
+
+// read returns the first snapshot captured for a canonical path and reuses the
+// same bytes when another observed path resolves to the same file identity.
+func (cache *fileSnapshotCache) read(name string) (fileSnapshot, error) {
+	path, err := canonicalFilePath(name)
+	if err != nil {
+		return fileSnapshot{}, err
+	}
+	if snapshot, ok := cache.byPath[path]; ok {
+		return snapshot, nil
+	}
+	snapshot, err := readFileSnapshot(path)
+	if err != nil {
+		return fileSnapshot{}, err
+	}
+	if existing, ok := cache.byIdentity[snapshot.identity]; ok {
+		snapshot.info = existing.info
+		snapshot.links = existing.links
+		snapshot.data = existing.data
+	} else {
+		cache.byIdentity[snapshot.identity] = snapshot
+	}
+	cache.byPath[path] = snapshot
+	return snapshot, nil
+}
+
+// canonicalFilePath resolves a user path and symlinks to one clean absolute
+// path used by snapshot caching and fresh transaction reads.
+func canonicalFilePath(name string) (string, error) {
 	absolute, err := filepath.Abs(name)
 	if err != nil {
-		return fileSnapshot{}, fmt.Errorf("%s: cannot resolve path: %w", name, err)
+		return "", fmt.Errorf("%s: cannot resolve path: %w", name, err)
 	}
 	path, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
-		return fileSnapshot{}, fmt.Errorf("%s: cannot resolve path: %w", name, err)
+		return "", fmt.Errorf("%s: cannot resolve path: %w", name, err)
 	}
-	path = filepath.Clean(path)
+	return filepath.Clean(path), nil
+}
+
+// readFileSnapshot resolves a regular text file and captures its identity,
+// hard-link count, metadata, and validated bytes from the same open handle.
+func readFileSnapshot(name string) (fileSnapshot, error) {
+	path, err := canonicalFilePath(name)
+	if err != nil {
+		return fileSnapshot{}, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return fileSnapshot{}, fmt.Errorf("%s: cannot stat: %w", path, err)

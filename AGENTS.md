@@ -112,7 +112,8 @@ For release-bound changes, also run `./scripts/build-artifacts.sh`, verify
 
 ## CLI and data-safety invariants
 
-- `edit` is a dry run unless the caller explicitly passes `--apply`.
+- `edit` is a dry run unless the caller explicitly passes `--apply` together
+  with the exact `--expect-plan` SHA-256 emitted by the reviewed dry run.
 - Validate every selector, guard, snapshot, and output before writing any file.
 - Group aliases to the same file; reject ambiguous hard-link behavior.
 - Stage replacements beside their targets. A later failure must not leave a

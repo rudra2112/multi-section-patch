@@ -34,7 +34,7 @@ func TestWindowsEditRejectsReadOnlyTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
 
 	if code != 1 || stdout != "" {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -83,7 +83,7 @@ func TestWindowsEditRejectsExclusivelyOpenedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
 	if err := syscall.CloseHandle(handle); err != nil {
 		t.Fatal(err)
 	}

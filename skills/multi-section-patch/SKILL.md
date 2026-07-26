@@ -63,7 +63,8 @@ sections, use a JSON specification:
 Run `"<multi-section-patch>" read --spec sections.json`, or pass the JSON on
 standard input. Every result includes its path, resolved line range, exact
 content, and SHA-256 digest. Keep the executable path quoted if it contains
-spaces.
+spaces. With `--json`, parse successful results from stdout and the single
+`error` object from stderr when the exit status is nonzero.
 
 ## Edit sections
 
@@ -90,20 +91,25 @@ Prepare a JSON edit specification with tight bounds:
 
 Use these guards when applicable:
 
-- `expected_sha256`: verify the selected current section before editing.
-- `must_contain`: require one or more strings in the selected section.
+- `expected_sha256`: verify the selected current section before editing; when
+  present, the digest must not be empty.
+- `must_contain`: require one or more non-empty strings in the selected section.
+- `replacement_file`: read replacement text from a non-empty file path.
 - `include_start`: defaults to `true`; set `false` to preserve the start marker.
 - `include_end`: defaults to `false`; set `true` to replace the end marker too.
-- `occurrence` and `end_occurrence`: choose later matching markers.
+- `occurrence`: choose a later start-marker match.
+- `end_occurrence`: choose a later end-marker match.
 
 Follow this sequence:
 
 1. Run `"<multi-section-patch>" read` for every target section.
 2. Build edit JSON with tight bounds and, when useful, `expected_sha256`.
-3. Run `"<multi-section-patch>" edit --spec edits.json`.
-4. Review the complete diff. Dry run is the default and changes no target.
-5. Run `"<multi-section-patch>" edit --spec edits.json --apply` only after the
-   diff is accepted.
+3. Run `"<multi-section-patch>" edit --spec edits.json --json`.
+4. Review the complete diff and retain its `plan_sha256`. Dry run is the
+   default and changes no target.
+5. After approval, run
+   `"<multi-section-patch>" edit --spec edits.json --apply --expect-plan <plan_sha256>`.
+   The command refuses to write if the rebuilt plan differs.
 6. Add `--backup` when independent original-file copies are needed.
 
 Multi Section Patch rejects invalid input, missing files or invalid bounds,

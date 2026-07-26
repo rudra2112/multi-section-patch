@@ -21,6 +21,60 @@ func invoke(args []string, input string) (int, string, string) {
 	return code, stdout.String(), stderr.String()
 }
 
+type jsonErrorEnvelope struct {
+	Error struct {
+		Code      string `json:"code"`
+		Command   string `json:"command"`
+		Message   string `json:"message"`
+		ItemIndex int    `json:"item_index"`
+		Name      string `json:"name"`
+		File      string `json:"file"`
+		Field     string `json:"field"`
+	} `json:"error"`
+}
+
+func decodeJSONError(t *testing.T, stderr string) jsonErrorEnvelope {
+	t.Helper()
+	var payload jsonErrorEnvelope
+	if err := json.Unmarshal([]byte(stderr), &payload); err != nil {
+		t.Fatalf("stderr is not a JSON error envelope: %v\n%s", err, stderr)
+	}
+	if payload.Error.Code == "" || payload.Error.Command == "" || payload.Error.Message == "" {
+		t.Fatalf("incomplete JSON error envelope: %#v", payload)
+	}
+	return payload
+}
+
+func dryRunPlanSHA256(t *testing.T, spec string) string {
+	t.Helper()
+	code, stdout, stderr := invoke([]string{"edit", "--json"}, spec)
+	if code != 0 {
+		t.Fatalf("dry-run code = %d, stderr = %q", code, stderr)
+	}
+	var payload struct {
+		PlanSHA256 string `json:"plan_sha256"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("cannot decode dry-run JSON: %v\n%s", err, stdout)
+	}
+	if len(payload.PlanSHA256) != sha256.Size*2 {
+		t.Fatalf("plan_sha256 = %q, want %d lowercase hex characters", payload.PlanSHA256, sha256.Size*2)
+	}
+	if decoded, err := hex.DecodeString(payload.PlanSHA256); err != nil || len(decoded) != sha256.Size {
+		t.Fatalf("plan_sha256 = %q, want lowercase SHA-256: %v", payload.PlanSHA256, err)
+	}
+	if payload.PlanSHA256 != strings.ToLower(payload.PlanSHA256) {
+		t.Fatalf("plan_sha256 = %q, want lowercase", payload.PlanSHA256)
+	}
+	return payload.PlanSHA256
+}
+
+func reviewedApplyArgs(t *testing.T, spec string, extra ...string) []string {
+	t.Helper()
+	args := []string{"edit", "--apply", "--expect-plan", dryRunPlanSHA256(t, spec)}
+	return append(args, extra...)
+}
+
 func TestReadMultipleSections(t *testing.T) {
 	root := t.TempDir()
 	first := filepath.Join(root, "first.md")
@@ -48,6 +102,30 @@ func TestReadMultipleSections(t *testing.T) {
 	}
 	if strings.Contains(stdout, "bye") {
 		t.Errorf("stdout contains unselected content:\n%s", stdout)
+	}
+}
+
+func TestFileSnapshotCacheReusesCanonicalFile(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "sample.txt")
+	writeTestFile(t, target, "before\n")
+	cache := newFileSnapshotCache()
+
+	first, err := cache.read(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, target, "after\n")
+	second, err := cache.read(filepath.Join(root, ".", "sample.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(first.data, []byte("before\n")) ||
+		!bytes.Equal(second.data, first.data) ||
+		second.path != first.path ||
+		second.identity != first.identity {
+		t.Fatalf("cache returned different snapshots: first=%#v second=%#v", first, second)
 	}
 }
 
@@ -213,6 +291,397 @@ func TestReadRejectsMixedSelectorFamilies(t *testing.T) {
 	}
 }
 
+func TestReadRejectsEditOnlyFields(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	for field, value := range map[string]any{
+		"replacement":      "",
+		"replacement_file": "",
+		"expected_sha256":  "",
+		"must_contain":     []string{},
+	} {
+		t.Run(field, func(t *testing.T) {
+			item := map[string]any{"file": target}
+			item[field] = value
+			spec, err := json.Marshal(map[string]any{
+				"sections": []map[string]any{item},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, stdout, stderr := invoke([]string{"read", "--json"}, string(spec))
+
+			if code != 1 || stdout != "" {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			payload := decodeJSONError(t, stderr)
+			if payload.Error.Code != "invalid_spec" ||
+				payload.Error.Command != "read" ||
+				payload.Error.ItemIndex != 1 ||
+				payload.Error.File != target ||
+				payload.Error.Field != field {
+				t.Fatalf("unexpected JSON error: %#v", payload.Error)
+			}
+		})
+	}
+}
+
+func TestCommandsRejectMarkerOptionsWithoutTheirBound(t *testing.T) {
+	cases := []struct {
+		name       string
+		boundField string
+		boundValue any
+		option     string
+		value      any
+	}{
+		{
+			name:       "occurrence without start",
+			boundField: "end",
+			boundValue: "two",
+			option:     "occurrence",
+			value:      1,
+		},
+		{
+			name:       "end occurrence without end",
+			boundField: "start",
+			boundValue: "one",
+			option:     "end_occurrence",
+			value:      1,
+		},
+		{
+			name:       "include start without start",
+			boundField: "end",
+			boundValue: "two",
+			option:     "include_start",
+			value:      false,
+		},
+		{
+			name:       "include end without end",
+			boundField: "start",
+			boundValue: "one",
+			option:     "include_end",
+			value:      true,
+		},
+	}
+	for _, command := range []string{"read", "edit"} {
+		for _, test := range cases {
+			t.Run(command+"/"+test.name, func(t *testing.T) {
+				target := filepath.Join(t.TempDir(), "sample.txt")
+				writeTestFile(t, target, "one\ntwo\n")
+				item := map[string]any{
+					"file":          target,
+					test.boundField: test.boundValue,
+					test.option:     test.value,
+				}
+				key := "sections"
+				if command == "edit" {
+					key = "edits"
+					item["replacement"] = "changed\n"
+				}
+				spec, err := json.Marshal(map[string]any{
+					key: []map[string]any{item},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				code, stdout, stderr := invoke([]string{command, "--json"}, string(spec))
+
+				if code != 1 || stdout != "" {
+					t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+				}
+				payload := decodeJSONError(t, stderr)
+				if payload.Error.Code != "invalid_spec" ||
+					payload.Error.Command != command ||
+					payload.Error.ItemIndex != 1 ||
+					payload.Error.File != target ||
+					payload.Error.Field != test.option {
+					t.Fatalf("unexpected JSON error: %#v", payload.Error)
+				}
+			})
+		}
+	}
+}
+
+func TestJSONErrorReportsSectionContext(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "missing.txt")
+	spec, err := json.Marshal(map[string]any{
+		"sections": []map[string]any{{
+			"name":       "missing section",
+			"file":       target,
+			"start_line": 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := invoke([]string{"read", "--json"}, string(spec))
+
+	if code != 1 || stdout != "" {
+		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	payload := decodeJSONError(t, stderr)
+	if payload.Error.Code != "section_resolution_failed" ||
+		payload.Error.Command != "read" ||
+		payload.Error.ItemIndex != 1 ||
+		payload.Error.Name != "missing section" ||
+		payload.Error.File != target {
+		t.Fatalf("unexpected JSON error: %#v", payload.Error)
+	}
+}
+
+func TestJSONErrorDetectionUsesCommandSpecificOptions(t *testing.T) {
+	for name, args := range map[string][]string{
+		"edit does not consume read context": {"edit", "--context", "--json"},
+		"read does not consume edit plan":    {"read", "--expect-plan", "--json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := invoke(args, "")
+
+			if code != 1 || stdout != "" {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			payload := decodeJSONError(t, stderr)
+			if payload.Error.Code != "invalid_option" {
+				t.Fatalf("unexpected JSON error: %#v", payload.Error)
+			}
+		})
+	}
+}
+
+func TestEditRejectsEmptyMustContainGuard(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	for name, guard := range map[string]any{
+		"empty string": "",
+		"empty list":   []string{},
+		"empty entry":  []string{"one", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec, err := json.Marshal(map[string]any{
+				"edits": []map[string]any{{
+					"file":         target,
+					"replacement":  "ONE\n",
+					"must_contain": guard,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, stdout, stderr := invoke([]string{"edit", "--json"}, string(spec))
+
+			if code != 1 || stdout != "" {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			payload := decodeJSONError(t, stderr)
+			if payload.Error.Code != "invalid_spec" ||
+				payload.Error.ItemIndex != 1 ||
+				payload.Error.File != target ||
+				payload.Error.Field != "must_contain" {
+				t.Fatalf("unexpected JSON error: %#v", payload.Error)
+			}
+		})
+	}
+}
+
+func TestJSONTypeErrorsReportField(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	for _, test := range []struct {
+		name    string
+		command string
+		key     string
+		field   string
+		item    map[string]any
+	}{
+		{
+			name:    "read line number",
+			command: "read",
+			key:     "sections",
+			field:   "start_line",
+			item: map[string]any{
+				"file":       target,
+				"start_line": "not-a-number",
+			},
+		},
+		{
+			name:    "edit guard",
+			command: "edit",
+			key:     "edits",
+			field:   "must_contain",
+			item: map[string]any{
+				"file":         target,
+				"replacement":  "ONE\n",
+				"must_contain": 7,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec, err := json.Marshal(map[string]any{
+				test.key: []map[string]any{test.item},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, stdout, stderr := invoke([]string{test.command, "--json"}, string(spec))
+
+			if code != 1 || stdout != "" {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			payload := decodeJSONError(t, stderr)
+			if payload.Error.Code != "invalid_spec" ||
+				payload.Error.Command != test.command ||
+				payload.Error.ItemIndex != 1 ||
+				payload.Error.File != target ||
+				payload.Error.Field != test.field {
+				t.Fatalf("unexpected JSON error: %#v", payload.Error)
+			}
+		})
+	}
+}
+
+func TestJSONSemanticErrorsReportField(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "sample.txt")
+	missing := filepath.Join(root, "missing.txt")
+	writeTestFile(t, target, "one\n")
+	for _, test := range []struct {
+		name    string
+		command string
+		key     string
+		code    string
+		field   string
+		item    map[string]any
+	}{
+		{
+			name:    "read target",
+			command: "read",
+			key:     "sections",
+			code:    "section_resolution_failed",
+			field:   "file",
+			item:    map[string]any{"file": missing},
+		},
+		{
+			name:    "read occurrence",
+			command: "read",
+			key:     "sections",
+			code:    "section_resolution_failed",
+			field:   "occurrence",
+			item: map[string]any{
+				"file":       target,
+				"start":      "one",
+				"occurrence": 0,
+			},
+		},
+		{
+			name:    "read regular expression",
+			command: "read",
+			key:     "sections",
+			code:    "section_resolution_failed",
+			field:   "start_regex",
+			item: map[string]any{
+				"file":        target,
+				"start_regex": "[",
+			},
+		},
+		{
+			name:    "edit digest guard",
+			command: "edit",
+			key:     "edits",
+			code:    "edit_plan_failed",
+			field:   "expected_sha256",
+			item: map[string]any{
+				"file":            target,
+				"replacement":     "ONE\n",
+				"expected_sha256": strings.Repeat("0", sha256.Size*2),
+			},
+		},
+		{
+			name:    "edit content guard",
+			command: "edit",
+			key:     "edits",
+			code:    "edit_plan_failed",
+			field:   "must_contain",
+			item: map[string]any{
+				"file":         target,
+				"replacement":  "ONE\n",
+				"must_contain": "missing",
+			},
+		},
+		{
+			name:    "edit replacement file",
+			command: "edit",
+			key:     "edits",
+			code:    "edit_plan_failed",
+			field:   "replacement_file",
+			item: map[string]any{
+				"file":             target,
+				"replacement_file": missing,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec, err := json.Marshal(map[string]any{
+				test.key: []map[string]any{test.item},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, stdout, stderr := invoke([]string{test.command, "--json"}, string(spec))
+
+			if code != 1 || stdout != "" {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			payload := decodeJSONError(t, stderr)
+			if payload.Error.Code != test.code ||
+				payload.Error.Command != test.command ||
+				payload.Error.ItemIndex != 1 ||
+				payload.Error.Field != test.field {
+				t.Fatalf("unexpected JSON error: %#v", payload.Error)
+			}
+		})
+	}
+}
+
+func TestEditRejectsPresentEmptyFields(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	for _, field := range []string{"expected_sha256", "replacement_file"} {
+		t.Run(field, func(t *testing.T) {
+			item := map[string]any{
+				"file":        target,
+				"replacement": "ONE\n",
+				field:         "",
+			}
+			spec, err := json.Marshal(map[string]any{
+				"edits": []map[string]any{item},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, stdout, stderr := invoke([]string{"edit", "--json"}, string(spec))
+
+			if code != 1 || stdout != "" {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			payload := decodeJSONError(t, stderr)
+			if payload.Error.Code != "invalid_spec" ||
+				payload.Error.Command != "edit" ||
+				payload.Error.ItemIndex != 1 ||
+				payload.Error.File != target ||
+				payload.Error.Field != field {
+				t.Fatalf("unexpected JSON error: %#v", payload.Error)
+			}
+		})
+	}
+}
+
 func TestReadRejectsNullAndInvalidUTF8Specs(t *testing.T) {
 	for name, input := range map[string]string{
 		"top-level null": "null",
@@ -246,8 +715,12 @@ func TestReadRejectsUnknownTopLevelField(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, `unknown top-level field "sectons"`) {
-		t.Fatalf("unexpected stderr: %q", stderr)
+	payload := decodeJSONError(t, stderr)
+	if payload.Error.Code != "invalid_spec" ||
+		payload.Error.Command != "read" ||
+		payload.Error.Field != "sectons" ||
+		!strings.Contains(payload.Error.Message, `unknown top-level field "sectons"`) {
+		t.Fatalf("unexpected JSON error: %#v", payload.Error)
 	}
 	if stdout != "" {
 		t.Fatalf("stdout = %q, want empty", stdout)
@@ -407,6 +880,197 @@ func TestErrorsEscapeUntrustedControlCharacters(t *testing.T) {
 	}
 }
 
+func TestEditPlanSHA256IsDeterministic(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	compact := editSpec(t, target, "ONE\n")
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, []byte(compact), "", "  "); err != nil {
+		t.Fatal(err)
+	}
+
+	first := dryRunPlanSHA256(t, compact)
+	second := dryRunPlanSHA256(t, indented.String())
+
+	if first != second {
+		t.Fatalf("equivalent plans differ: %s != %s", first, second)
+	}
+	code, stdout, stderr := invoke([]string{"edit"}, compact)
+	if code != 0 {
+		t.Fatalf("human dry-run code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "Plan SHA-256: "+first) {
+		t.Fatalf("human dry run omits plan hash:\n%s", stdout)
+	}
+}
+
+func TestApplyRequiresReviewedPlan(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	spec := editSpec(t, target, "ONE\n")
+
+	code, stdout, stderr := invoke([]string{"edit", "--apply", "--json"}, spec)
+
+	if code != 1 || stdout != "" {
+		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	payload := decodeJSONError(t, stderr)
+	if payload.Error.Code != "invalid_option" ||
+		!strings.Contains(payload.Error.Message, "--apply requires --expect-plan") {
+		t.Fatalf("unexpected JSON error: %#v", payload.Error)
+	}
+	assertFileContent(t, target, "one\n")
+}
+
+func TestApplyRejectsMalformedReviewedPlan(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	spec := editSpec(t, target, "ONE\n")
+
+	code, stdout, stderr := invoke(
+		[]string{"edit", "--apply", "--expect-plan", "ABC", "--json"},
+		spec,
+	)
+
+	if code != 1 || stdout != "" {
+		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	payload := decodeJSONError(t, stderr)
+	if payload.Error.Code != "invalid_option" ||
+		!strings.Contains(payload.Error.Message, "64-character lowercase SHA-256") {
+		t.Fatalf("unexpected JSON error: %#v", payload.Error)
+	}
+	assertFileContent(t, target, "one\n")
+}
+
+func TestApplyRejectsReviewedPlanMismatch(t *testing.T) {
+	t.Run("replacement changed", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "sample.txt")
+		writeTestFile(t, target, "one\n")
+		reviewedSpec := editSpec(t, target, "ONE\n")
+		reviewedPlan := dryRunPlanSHA256(t, reviewedSpec)
+		changedSpec := editSpec(t, target, "DIFFERENT\n")
+
+		code, stdout, stderr := invoke(
+			[]string{"edit", "--apply", "--expect-plan", reviewedPlan, "--json"},
+			changedSpec,
+		)
+
+		if code != 1 || stdout != "" {
+			t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+		}
+		payload := decodeJSONError(t, stderr)
+		if payload.Error.Code != "plan_mismatch" ||
+			!strings.Contains(payload.Error.Message, "new dry run") {
+			t.Fatalf("unexpected JSON error: %#v", payload.Error)
+		}
+		assertFileContent(t, target, "one\n")
+	})
+
+	t.Run("unselected target content changed", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "sample.txt")
+		writeTestFile(t, target, "header\none\n")
+		spec, err := json.Marshal(map[string]any{
+			"edits": []map[string]any{{
+				"file":        target,
+				"start_line":  2,
+				"end_line":    2,
+				"replacement": "ONE\n",
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviewedPlan := dryRunPlanSHA256(t, string(spec))
+		writeTestFile(t, target, "changed header\none\n")
+
+		code, stdout, stderr := invoke(
+			[]string{"edit", "--apply", "--expect-plan", reviewedPlan, "--json"},
+			string(spec),
+		)
+
+		if code != 1 || stdout != "" {
+			t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+		}
+		payload := decodeJSONError(t, stderr)
+		if payload.Error.Code != "plan_mismatch" {
+			t.Fatalf("unexpected JSON error: %#v", payload.Error)
+		}
+		assertFileContent(t, target, "changed header\none\n")
+	})
+
+	t.Run("no-op companion target changed", func(t *testing.T) {
+		root := t.TempDir()
+		changedTarget := filepath.Join(root, "changed.txt")
+		noOpTarget := filepath.Join(root, "no-op.txt")
+		writeTestFile(t, changedTarget, "one\n")
+		writeTestFile(t, noOpTarget, "header\nsame\n")
+		spec, err := json.Marshal(map[string]any{
+			"edits": []map[string]any{
+				{
+					"file":        changedTarget,
+					"start_line":  1,
+					"end_line":    1,
+					"replacement": "ONE\n",
+				},
+				{
+					"file":        noOpTarget,
+					"start_line":  2,
+					"end_line":    2,
+					"replacement": "same\n",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviewedPlan := dryRunPlanSHA256(t, string(spec))
+		writeTestFile(t, noOpTarget, "changed header\nsame\n")
+
+		code, stdout, stderr := invoke(
+			[]string{"edit", "--apply", "--expect-plan", reviewedPlan, "--json"},
+			string(spec),
+		)
+
+		if code != 1 || stdout != "" {
+			t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+		}
+		payload := decodeJSONError(t, stderr)
+		if payload.Error.Code != "plan_mismatch" {
+			t.Fatalf("unexpected JSON error: %#v", payload.Error)
+		}
+		assertFileContent(t, changedTarget, "one\n")
+		assertFileContent(t, noOpTarget, "changed header\nsame\n")
+	})
+}
+
+func TestApplyWithReviewedPlan(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "sample.txt")
+	writeTestFile(t, target, "one\n")
+	spec := editSpec(t, target, "ONE\n")
+	plan := dryRunPlanSHA256(t, spec)
+
+	code, stdout, stderr := invoke(
+		[]string{"edit", "--apply", "--expect-plan", plan, "--json"},
+		spec,
+	)
+
+	if code != 0 || stderr != "" {
+		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	var payload struct {
+		Applied    bool   `json:"applied"`
+		PlanSHA256 string `json:"plan_sha256"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("cannot decode apply JSON: %v\n%s", err, stdout)
+	}
+	if !payload.Applied || payload.PlanSHA256 != plan {
+		t.Fatalf("unexpected apply JSON: %#v", payload)
+	}
+	assertFileContent(t, target, "ONE\n")
+}
+
 func TestEditDryRunAndApply(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "sample.txt")
 	if err := os.WriteFile(target, []byte("one\r\ntwo\r\n"), 0o640); err != nil {
@@ -437,7 +1101,7 @@ func TestEditDryRunAndApply(t *testing.T) {
 		t.Fatalf("dry run changed target to %q", got)
 	}
 
-	code, stdout, stderr = invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr = invoke(reviewedApplyArgs(t, string(spec)), string(spec))
 	if code != 0 {
 		t.Fatalf("apply code = %d, stderr = %q", code, stderr)
 	}
@@ -670,7 +1334,7 @@ func TestApplyPreservesUnicodeCRLFAndMissingFinalNewline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke(reviewedApplyArgs(t, string(spec)), string(spec))
 
 	if code != 0 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -709,7 +1373,7 @@ func TestEditCombinesRelativeAndAbsoluteAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke(reviewedApplyArgs(t, string(spec)), string(spec))
 
 	if code != 0 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -748,7 +1412,7 @@ func TestEditCombinesSymlinkAliasesWithoutReplacingTheLink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke(reviewedApplyArgs(t, string(spec)), string(spec))
 
 	if code != 0 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -789,7 +1453,7 @@ func TestEditMarkerGuardsAndReplacementFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke(reviewedApplyArgs(t, string(spec)), string(spec))
 
 	if code != 0 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -817,7 +1481,7 @@ func TestEditRejectsHardLinkedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
 
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -852,7 +1516,7 @@ func TestEditRejectsOverlappingSections(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
 
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -887,7 +1551,7 @@ func TestEditAllowsAdjacentSectionsAndSkipsNoOpBackups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(adjacent))
+	code, stdout, stderr := invoke(reviewedApplyArgs(t, string(adjacent)), string(adjacent))
 	if code != 0 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
 	}
@@ -905,7 +1569,7 @@ func TestEditAllowsAdjacentSectionsAndSkipsNoOpBackups(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, stdout, stderr = invoke(
-		[]string{"edit", "--apply", "--backup", "--json"},
+		reviewedApplyArgs(t, string(noOp), "--backup", "--json"),
 		string(noOp),
 	)
 	if code != 0 {
@@ -944,7 +1608,7 @@ func TestEditRejectsHashMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
 
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -964,7 +1628,7 @@ func TestEditRejectsUnknownGuardField(t *testing.T) {
 		target,
 	)
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, spec)
+	code, stdout, stderr := invoke([]string{"edit"}, spec)
 
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -984,7 +1648,7 @@ func TestEditRejectsNullMustContainEntry(t *testing.T) {
 		target,
 	)
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, spec)
+	code, stdout, stderr := invoke([]string{"edit"}, spec)
 
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -1010,7 +1674,7 @@ func TestEditRejectsNULReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply"}, string(spec))
+	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
 
 	if code != 1 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
@@ -1442,7 +2106,10 @@ func TestEditReportsBackupDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit", "--apply", "--backup", "--json"}, string(spec))
+	code, stdout, stderr := invoke(
+		reviewedApplyArgs(t, string(spec), "--backup", "--json"),
+		string(spec),
+	)
 
 	if code != 0 {
 		t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout, stderr)

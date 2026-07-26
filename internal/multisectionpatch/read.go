@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,41 +47,50 @@ type readOptions struct {
 func runRead(args []string, stdin io.Reader, stdout io.Writer) error {
 	options, err := parseReadOptions(args)
 	if err != nil {
-		return err
+		return annotateError(err, errorContext{code: errorInvalidOption})
 	}
 
 	var items []sectionItem
 	if options.readFromSpec {
 		data, err := loadSpecData(options.specPath, stdin)
 		if err != nil {
-			return err
+			return annotateError(err, errorContext{code: errorSpecReadFailed})
 		}
 		items, err = decodeSectionItems(data, "sections")
 		if err != nil {
-			return err
+			return annotateError(err, errorContext{code: errorInvalidSpec})
 		}
 	} else {
 		items = make([]sectionItem, 0, len(options.selectors))
-		for _, selector := range options.selectors {
+		for index, selector := range options.selectors {
 			item, err := parseSelector(selector)
 			if err != nil {
-				return err
+				return annotateItemError(
+					err,
+					errorInvalidSpec,
+					index,
+					sectionItem{File: selector},
+				)
 			}
 			items = append(items, item)
 		}
 	}
 
 	sections := make([]section, 0, len(items))
-	for _, item := range items {
-		resolved, err := resolveSection(item)
+	snapshots := newFileSnapshotCache()
+	for index, item := range items {
+		resolved, err := resolveSection(item, snapshots)
 		if err != nil {
-			return err
+			return annotateItemError(err, errorSectionResolutionFailed, index, item)
 		}
 		sections = append(sections, resolved)
 	}
 
 	if options.json {
-		return writeSectionsJSON(stdout, sections)
+		return annotateError(
+			writeSectionsJSON(stdout, sections),
+			errorContext{code: errorOutputFailed},
+		)
 	}
 	for _, selected := range sections {
 		startLine, endLine := displayRange(selected)
@@ -95,23 +103,23 @@ func runRead(args []string, stdin io.Reader, stdout io.Writer) error {
 			endLine,
 			selected.digest(),
 		); err != nil {
-			return err
+			return annotateError(err, errorContext{code: errorOutputFailed})
 		}
 		outStart := max(0, selected.start-options.context)
 		outEnd := min(len(selected.lines), selected.end+options.context)
 		for index := outStart; index < outEnd; index++ {
 			if options.lineNumbers {
 				if err := writeOutputf(stdout, "%6d| ", index+1); err != nil {
-					return err
+					return annotateError(err, errorContext{code: errorOutputFailed})
 				}
 			}
 			line := selected.lines[index]
 			if err := writeDisplayLine(stdout, line); err != nil {
-				return err
+				return annotateError(err, errorContext{code: errorOutputFailed})
 			}
 			if line != "" && !strings.HasSuffix(line, "\n") && !strings.HasSuffix(line, "\r") {
 				if err := writeOutputString(stdout, "\n"); err != nil {
-					return err
+					return annotateError(err, errorContext{code: errorOutputFailed})
 				}
 			}
 		}
@@ -120,7 +128,7 @@ func runRead(args []string, stdin io.Reader, stdout io.Writer) error {
 			"<<<END_MULTI_SECTION_PATCH path=%s>>>\n",
 			strconv.Quote(selected.path),
 		); err != nil {
-			return err
+			return annotateError(err, errorContext{code: errorOutputFailed})
 		}
 	}
 	return nil
@@ -232,14 +240,14 @@ func inlinePattern(value string) (literal, regex *string) {
 	return &value, nil
 }
 
-// resolveSection reads and validates a file, resolves the requested line
+// resolveSection reads one cached file snapshot, resolves the requested line
 // bounds, and records the display name alongside the original line data.
-func resolveSection(item sectionItem) (section, error) {
-	path, data, err := readTextFile(item.File)
+func resolveSection(item sectionItem, snapshots *fileSnapshotCache) (section, error) {
+	snapshot, err := snapshots.read(item.File)
 	if err != nil {
-		return section{}, err
+		return section{}, annotateFieldError(err, "file")
 	}
-	lines := splitLines(string(data))
+	lines := splitLines(string(snapshot.data))
 	start, end, err := sectionRange(item, lines)
 	if err != nil {
 		return section{}, err
@@ -248,53 +256,13 @@ func resolveSection(item sectionItem) (section, error) {
 	if name == "" {
 		name = item.File
 	}
-	return section{path: path, name: name, start: start, end: end, lines: lines}, nil
-}
-
-// readTextFile resolves symlinks to a canonical path, verifies the opened
-// target is a regular file, and returns validated UTF-8 text bytes.
-func readTextFile(name string) (string, []byte, error) {
-	absolute, err := filepath.Abs(name)
-	if err != nil {
-		return "", nil, fmt.Errorf("%s: cannot resolve path: %w", name, err)
-	}
-	path, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return "", nil, fmt.Errorf("%s: cannot resolve path: %w", name, err)
-	}
-	path = filepath.Clean(path)
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", nil, fmt.Errorf("%s: cannot stat: %w", path, err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", nil, fmt.Errorf("%s: not a regular file", path)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return "", nil, fmt.Errorf("%s: cannot open: %w", path, err)
-	}
-	info, err = file.Stat()
-	if err != nil {
-		_ = file.Close()
-		return "", nil, fmt.Errorf("%s: cannot stat after opening: %w", path, err)
-	}
-	if !info.Mode().IsRegular() {
-		_ = file.Close()
-		return "", nil, fmt.Errorf("%s: not a regular file", path)
-	}
-	data, err := io.ReadAll(file)
-	if err != nil {
-		_ = file.Close()
-		return "", nil, fmt.Errorf("%s: cannot read: %w", path, err)
-	}
-	if err := file.Close(); err != nil {
-		return "", nil, fmt.Errorf("%s: cannot close after reading: %w", path, err)
-	}
-	if err := validateTextData(path, data); err != nil {
-		return "", nil, err
-	}
-	return path, data, nil
+	return section{
+		path:  snapshot.path,
+		name:  name,
+		start: start,
+		end:   end,
+		lines: lines,
+	}, nil
 }
 
 // sectionRange validates a selector and resolves it to a zero-based half-open
@@ -313,7 +281,19 @@ func sectionRange(item sectionItem, lines []string) (int, int, error) {
 			endLine = *item.EndLine
 		}
 		if startLine < 1 || endLine < startLine || startLine > len(lines) || endLine > len(lines) {
-			return 0, 0, fmt.Errorf("%s: invalid line range %d:%d", itemName(item), startLine, endLine)
+			field := "end_line"
+			if item.StartLine != nil && (startLine < 1 || startLine > len(lines)) {
+				field = "start_line"
+			}
+			return 0, 0, annotateFieldError(
+				fmt.Errorf(
+					"%s: invalid line range %d:%d",
+					itemName(item),
+					startLine,
+					endLine,
+				),
+				field,
+			)
 		}
 		return startLine - 1, endLine, nil
 	}
@@ -340,7 +320,11 @@ func sectionRange(item sectionItem, lines []string) (int, int, error) {
 	if pattern, ok := itemStartPattern(item); ok {
 		match, err := findLine(lines, pattern, 0, occurrence)
 		if err != nil {
-			return 0, 0, err
+			field := "start"
+			if pattern.regex {
+				field = "start_regex"
+			}
+			return 0, 0, annotateFieldError(err, field)
 		}
 		start = match
 		if !includeStart {
@@ -353,7 +337,11 @@ func sectionRange(item sectionItem, lines []string) (int, int, error) {
 	if pattern, ok := itemEndPattern(item); ok {
 		match, err := findLine(lines, pattern, endSearch, endOccurrence)
 		if err != nil {
-			return 0, 0, err
+			field := "end"
+			if pattern.regex {
+				field = "end_regex"
+			}
+			return 0, 0, annotateFieldError(err, field)
 		}
 		end = match
 		if includeEnd {
@@ -410,12 +398,35 @@ func validateSelectorFields(item sectionItem) error {
 	if families > 1 {
 		return fmt.Errorf("%s: use one selector family: lines, literal markers, or regex markers", itemName(item))
 	}
-	hasMarkerOptions := item.IncludeStart != nil ||
-		item.IncludeEnd != nil ||
-		item.Occurrence != nil ||
-		item.EndOccurrence != nil
-	if hasMarkerOptions && !literal && !regex {
-		return fmt.Errorf("%s: marker options require a literal or regex selector", itemName(item))
+	hasStart := item.Start != nil || item.StartRegex != nil
+	hasEnd := item.End != nil || item.EndRegex != nil
+	if item.IncludeStart != nil && !hasStart {
+		return fieldError(
+			"include_start",
+			"%s: include_start requires start or start_regex",
+			itemName(item),
+		)
+	}
+	if item.Occurrence != nil && !hasStart {
+		return fieldError(
+			"occurrence",
+			"%s: occurrence requires start or start_regex",
+			itemName(item),
+		)
+	}
+	if item.IncludeEnd != nil && !hasEnd {
+		return fieldError(
+			"include_end",
+			"%s: include_end requires end or end_regex",
+			itemName(item),
+		)
+	}
+	if item.EndOccurrence != nil && !hasEnd {
+		return fieldError(
+			"end_occurrence",
+			"%s: end_occurrence requires end or end_regex",
+			itemName(item),
+		)
 	}
 	return nil
 }
@@ -439,7 +450,10 @@ func occurrenceValue(name string, value *int) (int, error) {
 		return 1, nil
 	}
 	if *value < 1 {
-		return 0, fmt.Errorf("%s must be at least 1", name)
+		return 0, annotateFieldError(
+			fmt.Errorf("%s must be at least 1", name),
+			name,
+		)
 	}
 	return *value, nil
 }

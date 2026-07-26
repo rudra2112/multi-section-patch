@@ -32,7 +32,7 @@ Read options:
 | --- | --- |
 | `--spec FILE` | Read a JSON specification from `FILE`; use `-` for standard input |
 | `--context N` | Show `N` surrounding lines in human output |
-| `--json` | Emit machine-readable JSON |
+| `--json` | Emit machine-readable success JSON on stdout and failure JSON on stderr |
 | `--no-line-numbers` | Omit line prefixes from human output |
 | `--` | Treat every remaining argument as a selector |
 
@@ -71,8 +71,12 @@ The recommended JSON shape is:
 
 A top-level list containing the same items is also accepted. Use exactly one
 selector family in each item: line fields, literal marker fields, or regex
-marker fields. `occurrence` values are one-based. Marker defaults include the
-start line and exclude the end line.
+marker fields. Read items reject edit-only fields such as `replacement`,
+`replacement_file`, `expected_sha256`, and `must_contain`. `occurrence`
+requires a start marker, while `end_occurrence` requires an end marker; both
+values are one-based. `include_start` and `include_end` follow the same
+corresponding-bound rule. Marker defaults include the start line and exclude
+the end line.
 
 Each result contains the canonical path, name, resolved one-based range,
 SHA-256 of the exact selected bytes, and content. An empty whole file is
@@ -84,11 +88,12 @@ content cannot forge the output structure.
 ## Edit command
 
 ```text
-"<multi-section-patch>" edit [--spec FILE] [--json] [--backup] [--apply]
+"<multi-section-patch>" edit [--spec FILE] [--json] [--backup] [--apply --expect-plan SHA256]
 ```
 
 Edit is always a dry run unless `--apply` is present. The dry run resolves all
-edits and prints the complete proposed diff without changing target files.
+edits, prints the complete proposed diff, and returns an opaque `plan_sha256`
+without changing target files. Apply requires that exact identifier.
 
 The recommended JSON shape is:
 
@@ -126,31 +131,52 @@ Edit fields:
 | `include_end` | Replace the end marker line; defaults to `false` |
 | `occurrence`, `end_occurrence` | One-based marker occurrences |
 | `replacement` | Inline UTF-8 replacement text |
-| `replacement_file` | Path to UTF-8 replacement text |
-| `expected_sha256` | Required digest of the selected current bytes |
-| `must_contain` | Required string or list of strings in the selected bytes |
+| `replacement_file` | Non-empty path to UTF-8 replacement text |
+| `expected_sha256` | Required non-empty digest of the selected current bytes |
+| `must_contain` | Required non-empty string or non-empty list of non-empty strings |
 
-Specify exactly one of `replacement` and `replacement_file`. The same selector
-rules as `read` apply. Overlapping edits are rejected; adjacent edits are
-allowed. Replacements adopt the target's LF or CRLF style, while unrelated
-bytes and the target's final-newline state remain unchanged.
+Specify exactly one of `replacement` and `replacement_file`.
+`replacement_file` and `expected_sha256` cannot be empty when present. The
+same selector rules as `read` apply. Overlapping edits are rejected; adjacent
+edits are allowed. Replacements adopt the target's LF or CRLF style, while
+unrelated bytes and the target's final-newline state remain unchanged.
 
 Edit options:
 
 | Option | Behavior |
 | --- | --- |
 | `--spec FILE` | Read JSON from `FILE`; use `-` or omit it for standard input |
-| `--json` | Emit a structured diff and result |
+| `--json` | Emit structured success JSON on stdout and failure JSON on stderr |
 | `--backup` | With `--apply`, retain independent originals and a manifest |
-| `--apply` | Write the already validated plan |
+| `--apply` | Write only when accompanied by the reviewed plan identifier |
+| `--expect-plan SHA256` | Require the rebuilt plan to match this dry-run identifier |
 
-Before the first write, Multi Section Patch validates all selectors and guards,
-rejects ambiguous hard links, stages replacement and recovery files beside each
-target, and rechecks every target. It rechecks a target again immediately
-before its replacement. A multi-file batch is not filesystem-atomic; after a
-later failure, Multi Section Patch restores completed replacements when that
-cannot overwrite a concurrent change. Any incomplete rollback or cleanup
-reports the exact retained recovery path.
+Dry-run and successful-apply JSON use this shape:
+
+```json
+{
+  "diffs": ["complete unified diff"],
+  "changed_files": 1,
+  "plan_sha256": "64-character lowercase SHA-256",
+  "applied": false
+}
+```
+
+Successful apply output sets `applied` to `true`; with `--backup`, it also
+includes `backup_directory`.
+
+The plan identifier binds the ordered canonical targets, file identities,
+permission modes, complete original and final bytes, and resolved edits. On
+apply, Multi Section Patch rebuilds and compares it before diff output, staging,
+backup creation, or writes. A mismatch exposes no replacement plan; run and
+review a new dry run.
+
+After the plan comparison, Multi Section Patch stages replacement and recovery
+files beside each target and rechecks every target. It rechecks a target again
+immediately before its replacement. A multi-file batch is not
+filesystem-atomic; after a later failure, Multi Section Patch restores completed
+replacements when that cannot overwrite a concurrent change. Any incomplete
+rollback or cleanup reports the exact retained recovery path.
 
 ## Input and platform limits
 
@@ -171,6 +197,30 @@ reports the exact retained recovery path.
   or output failed.
 - Exit `2`: the command is missing or unknown.
 
-Errors are concise and contain no stack trace. Treat a nonzero apply result as
-requiring review even when the message says targets were rolled back, and keep
-any reported recovery file until its target is verified.
+Errors are concise and contain no stack trace. Without `--json`, stderr keeps
+the human `multi-section-patch: error:` form. With `--json`, a recognized
+command emits this envelope on stderr:
+
+```json
+{
+  "error": {
+    "code": "invalid_spec",
+    "command": "read",
+    "message": "diagnostic text",
+    "item_index": 1,
+    "name": "optional item name",
+    "file": "optional affected path",
+    "field": "optional affected field"
+  }
+}
+```
+
+The four context fields are omitted when unknown, and `item_index` is
+one-based. Stable error codes are `invalid_option`, `spec_read_failed`,
+`invalid_spec`, `section_resolution_failed`, `edit_plan_failed`,
+`plan_mismatch`, `apply_failed`, `output_failed`, and `operation_failed`.
+
+Treat a nonzero apply result as requiring review even when the message says
+targets were rolled back, and keep any reported recovery file until its target
+is verified. An output failure can occur after a successful apply, so exit `1`
+does not prove that targets are unchanged.

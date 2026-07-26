@@ -2,6 +2,8 @@ package multisectionpatch
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,10 +15,11 @@ import (
 )
 
 type editOptions struct {
-	specPath string
-	apply    bool
-	backup   bool
-	json     bool
+	specPath   string
+	expectPlan string
+	apply      bool
+	backup     bool
+	json       bool
 }
 
 type plannedEdit struct {
@@ -39,48 +42,71 @@ type filePlan struct {
 func runEdit(args []string, stdin io.Reader, stdout io.Writer) error {
 	options, err := parseEditOptions(args)
 	if err != nil {
-		return err
+		return annotateError(err, errorContext{code: errorInvalidOption})
 	}
 	data, err := loadSpecData(options.specPath, stdin)
 	if err != nil {
-		return err
+		return annotateError(err, errorContext{code: errorSpecReadFailed})
 	}
 	items, err := decodeSectionItems(data, "edits")
 	if err != nil {
-		return err
+		return annotateError(err, errorContext{code: errorInvalidSpec})
 	}
 	plans, err := planEdits(items)
 	if err != nil {
-		return err
+		return annotateError(err, errorContext{code: errorEditPlanFailed})
 	}
 
 	changed := changedPlans(plans)
+	planDigest, err := planSHA256(plans)
+	if err != nil {
+		return annotateError(err, errorContext{code: errorEditPlanFailed})
+	}
+	if options.apply && options.expectPlan != planDigest {
+		return annotateError(
+			errors.New(
+				"reviewed plan no longer matches; run a new dry run and review it before applying",
+			),
+			errorContext{code: errorPlanMismatch},
+		)
+	}
 	diffs := make([]string, 0, len(changed))
 	for _, plan := range changed {
 		diffs = append(diffs, unifiedDiff(plan))
 	}
 	if !options.apply {
 		if options.json {
-			if err := writeEditJSON(stdout, diffs, len(changed), false, ""); err != nil {
-				return err
+			if err := writeEditJSON(
+				stdout,
+				diffs,
+				len(changed),
+				planDigest,
+				false,
+				"",
+			); err != nil {
+				return annotateError(err, errorContext{code: errorOutputFailed})
 			}
 		} else if len(diffs) == 0 {
 			if err := writeOutputString(stdout, "No changes.\n"); err != nil {
-				return err
+				return annotateError(err, errorContext{code: errorOutputFailed})
 			}
 		} else {
 			for _, diff := range diffs {
 				if err := writeOutputString(stdout, diff); err != nil {
-					return err
+					return annotateError(err, errorContext{code: errorOutputFailed})
 				}
 			}
 		}
 		if !options.json {
+			if err := writeOutputf(stdout, "Plan SHA-256: %s\n", planDigest); err != nil {
+				return annotateError(err, errorContext{code: errorOutputFailed})
+			}
 			if err := writeOutputString(
 				stdout,
-				"Dry run only. Re-run with --apply to write changes.\n",
+				"Dry run only. Re-run with --apply --expect-plan "+
+					planDigest+" to write changes.\n",
 			); err != nil {
-				return err
+				return annotateError(err, errorContext{code: errorOutputFailed})
 			}
 		}
 		return nil
@@ -89,12 +115,12 @@ func runEdit(args []string, stdin io.Reader, stdout io.Writer) error {
 	if !options.json {
 		if len(diffs) == 0 {
 			if err := writeOutputString(stdout, "No changes.\n"); err != nil {
-				return err
+				return annotateError(err, errorContext{code: errorOutputFailed})
 			}
 		} else {
 			for _, diff := range diffs {
 				if err := writeOutputString(stdout, diff); err != nil {
-					return err
+					return annotateError(err, errorContext{code: errorOutputFailed})
 				}
 			}
 		}
@@ -107,17 +133,27 @@ func runEdit(args []string, stdin io.Reader, stdout io.Writer) error {
 		func(path string) { backupDirectory = path },
 	); err != nil {
 		if backupDirectory != "" {
-			return fmt.Errorf("%w; backups retained at %s", err, strconv.Quote(backupDirectory))
+			return annotateError(
+				fmt.Errorf("%w; backups retained at %s", err, strconv.Quote(backupDirectory)),
+				errorContext{code: errorApplyFailed},
+			)
 		}
-		return err
+		return annotateError(err, errorContext{code: errorApplyFailed})
 	}
 	if options.json {
-		if err := writeEditJSON(stdout, diffs, len(changed), true, backupDirectory); err != nil {
-			return err
+		if err := writeEditJSON(
+			stdout,
+			diffs,
+			len(changed),
+			planDigest,
+			true,
+			backupDirectory,
+		); err != nil {
+			return annotateError(err, errorContext{code: errorOutputFailed})
 		}
 	} else {
 		if err := writeOutputf(stdout, "Applied %d file(s).\n", len(changed)); err != nil {
-			return err
+			return annotateError(err, errorContext{code: errorOutputFailed})
 		}
 		if backupDirectory != "" {
 			if err := writeOutputf(
@@ -125,15 +161,15 @@ func runEdit(args []string, stdin io.Reader, stdout io.Writer) error {
 				"Backups: %s\n",
 				strconv.Quote(backupDirectory),
 			); err != nil {
-				return err
+				return annotateError(err, errorContext{code: errorOutputFailed})
 			}
 		}
 	}
 	return nil
 }
 
-// parseEditOptions recognizes the edit subcommand's specification, apply,
-// backup, and JSON flags and rejects every unknown argument.
+// parseEditOptions recognizes the edit subcommand's specification, reviewed
+// plan, apply, backup, and JSON flags and rejects invalid combinations.
 func parseEditOptions(args []string) (editOptions, error) {
 	var options editOptions
 	for index := 0; index < len(args); index++ {
@@ -146,6 +182,12 @@ func parseEditOptions(args []string) (editOptions, error) {
 			options.specPath = args[index]
 		case "--apply":
 			options.apply = true
+		case "--expect-plan":
+			index++
+			if index == len(args) {
+				return options, errors.New("--expect-plan requires a SHA-256 value")
+			}
+			options.expectPlan = args[index]
 		case "--backup":
 			options.backup = true
 		case "--json":
@@ -154,7 +196,26 @@ func parseEditOptions(args []string) (editOptions, error) {
 			return options, fmt.Errorf("unknown edit option %q", args[index])
 		}
 	}
+	if options.apply && options.expectPlan == "" {
+		return options, errors.New("--apply requires --expect-plan from a reviewed dry run")
+	}
+	if !options.apply && options.expectPlan != "" {
+		return options, errors.New("--expect-plan requires --apply")
+	}
+	if options.expectPlan != "" && !validPlanSHA256(options.expectPlan) {
+		return options, errors.New("--expect-plan must be a 64-character lowercase SHA-256")
+	}
 	return options, nil
+}
+
+// validPlanSHA256 reports whether a reviewed-plan token is canonical lowercase
+// SHA-256 text.
+func validPlanSHA256(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 // planEdits snapshots each target by filesystem identity, validates selectors
@@ -162,26 +223,55 @@ func parseEditOptions(args []string) (editOptions, error) {
 func planEdits(items []sectionItem) ([]*filePlan, error) {
 	plans := make([]*filePlan, 0)
 	plansByIdentity := make(map[string]*filePlan)
-	for _, item := range items {
+	snapshots := newFileSnapshotCache()
+	for index, item := range items {
 		if item.Replacement == nil && item.ReplacementFile == "" {
-			return nil, fmt.Errorf("%s: missing replacement or replacement_file", itemName(item))
+			return nil, annotateItemError(
+				fmt.Errorf("%s: missing replacement or replacement_file", itemName(item)),
+				errorEditPlanFailed,
+				index,
+				item,
+			)
 		}
 		if item.Replacement != nil && item.ReplacementFile != "" {
-			return nil, fmt.Errorf("%s: use replacement or replacement_file, not both", itemName(item))
+			return nil, annotateItemError(
+				fmt.Errorf("%s: use replacement or replacement_file, not both", itemName(item)),
+				errorEditPlanFailed,
+				index,
+				item,
+			)
 		}
 
-		snapshot, err := readFileSnapshot(item.File)
+		snapshot, err := snapshots.read(item.File)
 		if err != nil {
-			return nil, err
+			return nil, annotateItemError(
+				annotateFieldError(err, "file"),
+				errorEditPlanFailed,
+				index,
+				item,
+			)
 		}
 		if err := validateTargetForEdit(snapshot.path, snapshot.info); err != nil {
-			return nil, err
+			return nil, annotateItemError(
+				annotateFieldError(err, "file"),
+				errorEditPlanFailed,
+				index,
+				item,
+			)
 		}
 		if snapshot.links > 1 {
-			return nil, fmt.Errorf(
-				"%s: hard-link target has %d links; refusing ambiguous edit",
-				snapshot.path,
-				snapshot.links,
+			return nil, annotateItemError(
+				annotateFieldError(
+					fmt.Errorf(
+						"%s: hard-link target has %d links; refusing ambiguous edit",
+						snapshot.path,
+						snapshot.links,
+					),
+					"file",
+				),
+				errorEditPlanFailed,
+				index,
+				item,
 			)
 		}
 		plan := plansByIdentity[snapshot.identity]
@@ -197,12 +287,20 @@ func planEdits(items []sectionItem) ([]*filePlan, error) {
 			plansByIdentity[snapshot.identity] = plan
 		} else if !bytes.Equal(plan.original, snapshot.data) ||
 			plan.info.Mode().Perm() != snapshot.info.Mode().Perm() {
-			return nil, fmt.Errorf("%s: changed while planning edits", snapshot.path)
+			return nil, annotateItemError(
+				annotateFieldError(
+					fmt.Errorf("%s: changed while planning edits", snapshot.path),
+					"file",
+				),
+				errorEditPlanFailed,
+				index,
+				item,
+			)
 		}
 
 		start, end, err := sectionRange(item, plan.lines)
 		if err != nil {
-			return nil, err
+			return nil, annotateItemError(err, errorEditPlanFailed, index, item)
 		}
 		selected := section{
 			path:  plan.path,
@@ -212,24 +310,53 @@ func planEdits(items []sectionItem) ([]*filePlan, error) {
 			lines: plan.lines,
 		}
 		if item.ExpectedSHA256 != "" && item.ExpectedSHA256 != selected.digest() {
-			return nil, fmt.Errorf(
-				"%s: expected sha256 %s, found %s",
-				plan.path,
-				item.ExpectedSHA256,
-				selected.digest(),
+			return nil, annotateItemError(
+				annotateFieldError(
+					fmt.Errorf(
+						"%s: expected sha256 %s, found %s",
+						plan.path,
+						item.ExpectedSHA256,
+						selected.digest(),
+					),
+					"expected_sha256",
+				),
+				errorEditPlanFailed,
+				index,
+				item,
 			)
 		}
 		for _, required := range item.MustContain {
 			if !strings.Contains(selected.content(), required) {
-				return nil, fmt.Errorf("%s: selected section does not contain %q", plan.path, required)
+				return nil, annotateItemError(
+					annotateFieldError(
+						fmt.Errorf(
+							"%s: selected section does not contain %q",
+							plan.path,
+							required,
+						),
+						"must_contain",
+					),
+					errorEditPlanFailed,
+					index,
+					item,
+				)
 			}
 		}
-		replacement, err := replacementText(item)
+		replacement, err := replacementText(item, snapshots)
 		if err != nil {
-			return nil, err
+			return nil, annotateItemError(err, errorEditPlanFailed, index, item)
 		}
 		if err := validateTextData(itemName(item)+" replacement", []byte(replacement)); err != nil {
-			return nil, err
+			field := "replacement_file"
+			if item.Replacement != nil {
+				field = "replacement"
+			}
+			return nil, annotateItemError(
+				annotateFieldError(err, field),
+				errorEditPlanFailed,
+				index,
+				item,
+			)
 		}
 		plan.edits = append(plan.edits, plannedEdit{
 			section:     selected,
@@ -239,23 +366,26 @@ func planEdits(items []sectionItem) ([]*filePlan, error) {
 
 	for _, plan := range plans {
 		if err := finishPlan(plan); err != nil {
-			return nil, err
+			return nil, annotateError(
+				err,
+				errorContext{code: errorEditPlanFailed, file: plan.path},
+			)
 		}
 	}
 	return plans, nil
 }
 
-// replacementText returns an inline replacement or reads and validates the
-// replacement file through the same text-file path used by section reads.
-func replacementText(item sectionItem) (string, error) {
+// replacementText returns an inline replacement or reads a replacement file
+// through the same request-local snapshot cache used for edit targets.
+func replacementText(item sectionItem, snapshots *fileSnapshotCache) (string, error) {
 	if item.Replacement != nil {
 		return *item.Replacement, nil
 	}
-	_, data, err := readTextFile(item.ReplacementFile)
+	snapshot, err := snapshots.read(item.ReplacementFile)
 	if err != nil {
-		return "", err
+		return "", annotateFieldError(err, "replacement_file")
 	}
-	return string(data), nil
+	return string(snapshot.data), nil
 }
 
 // normalizeNewlines converts CRLF sequences in replacement text to LF, then
@@ -336,23 +466,78 @@ func changedPlans(plans []*filePlan) []*filePlan {
 	return changed
 }
 
+// planSHA256 returns a deterministic digest of the exact ordered file plans
+// that the diff and apply pipeline consume.
+func planSHA256(plans []*filePlan) (string, error) {
+	type digestEdit struct {
+		Start             int    `json:"start"`
+		End               int    `json:"end"`
+		ReplacementSHA256 string `json:"replacement_sha256"`
+	}
+	type digestFile struct {
+		Path           string       `json:"path"`
+		Identity       string       `json:"identity"`
+		Mode           uint32       `json:"mode"`
+		OriginalSHA256 string       `json:"original_sha256"`
+		UpdatedSHA256  string       `json:"updated_sha256"`
+		Edits          []digestEdit `json:"edits"`
+	}
+	payload := struct {
+		Format string       `json:"format"`
+		Files  []digestFile `json:"files"`
+	}{
+		Format: "multi-section-patch-plan-v1",
+		Files:  make([]digestFile, 0, len(plans)),
+	}
+	for _, plan := range plans {
+		originalDigest := sha256.Sum256(plan.original)
+		updatedDigest := sha256.Sum256(plan.updated)
+		file := digestFile{
+			Path:           plan.path,
+			Identity:       plan.identity,
+			Mode:           uint32(plan.info.Mode().Perm()),
+			OriginalSHA256: hex.EncodeToString(originalDigest[:]),
+			UpdatedSHA256:  hex.EncodeToString(updatedDigest[:]),
+			Edits:          make([]digestEdit, 0, len(plan.edits)),
+		}
+		for _, edit := range plan.edits {
+			replacementDigest := sha256.Sum256([]byte(edit.replacement))
+			file.Edits = append(file.Edits, digestEdit{
+				Start:             edit.section.start,
+				End:               edit.section.end,
+				ReplacementSHA256: hex.EncodeToString(replacementDigest[:]),
+			})
+		}
+		payload.Files = append(payload.Files, file)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("cannot encode edit plan: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
 // writeEditJSON serializes the generated diffs, changed-file count, apply
-// status, and optional backup directory as indented JSON.
+// status, plan digest, and optional backup directory as indented JSON.
 func writeEditJSON(
 	writer io.Writer,
 	diffs []string,
 	changed int,
+	planDigest string,
 	applied bool,
 	backupDirectory string,
 ) error {
 	payload := struct {
 		Diffs           []string `json:"diffs"`
 		ChangedFiles    int      `json:"changed_files"`
+		PlanSHA256      string   `json:"plan_sha256"`
 		Applied         bool     `json:"applied"`
 		BackupDirectory string   `json:"backup_directory,omitempty"`
 	}{
 		Diffs:           diffs,
 		ChangedFiles:    changed,
+		PlanSHA256:      planDigest,
 		Applied:         applied,
 		BackupDirectory: backupDirectory,
 	}

@@ -9,7 +9,7 @@ sections across multiple local text files.
 Instead of loading or rewriting entire files, a coding agent can request only
 the line ranges, headings, literal markers, or regular-expression bounds that
 matter. Editing defaults to a complete diff, and writing requires an explicit
-`--apply`.
+`--apply` plus the SHA-256 identifier emitted by that reviewed dry run.
 
 The installed skill is self-contained. It bundles native executables for
 Windows, macOS, and Linux, so normal use requires no Python, Node.js, Go,
@@ -19,7 +19,7 @@ compiler, package manager, network connection, or background service.
 | --- | --- |
 | Best for | Precise reads and coordinated, bounded edits across files |
 | Input | Regular UTF-8 text files |
-| Safe default | Dry run; writes require explicit `--apply` |
+| Safe default | Dry run; writes require `--apply` and its reviewed plan SHA-256 |
 | Platforms | Windows, macOS, and Linux on x86-64 and ARM64 |
 | Runtime dependencies | None beyond the bundled native executable |
 | Network and telemetry | None during normal `read` or `edit` use |
@@ -279,8 +279,9 @@ approve.
 ### Apply an approved edit
 
 ```text
-The dry-run diff is approved. Revalidate the same multi-section-patch edit
-specification and apply it. Report any nonzero exit or recovery file.
+The dry-run diff and plan SHA-256 are approved. Apply the same
+multi-section-patch edit specification with that exact plan SHA-256. Report
+any nonzero exit or recovery file.
 ```
 
 A well-behaved agent follows this sequence:
@@ -289,10 +290,10 @@ A well-behaved agent follows this sequence:
 2. Build a tightly bounded JSON edit specification.
 3. Add `expected_sha256` when the reviewed content must remain unchanged.
 4. Run `edit` without `--apply`.
-5. Present the entire diff.
+5. Present the entire diff and returned `plan_sha256`.
 6. Wait for approval.
-7. Rerun with `--apply`, which validates the current files again before
-   writing.
+7. Rerun with `--apply --expect-plan <plan_sha256>`. The command independently
+   rebuilds the plan and refuses to write if it differs.
 
 ## Direct CLI guide
 
@@ -440,14 +441,15 @@ Each edit uses exactly one selector family:
 Each edit also uses exactly one replacement source:
 
 - `replacement` for inline UTF-8 text; or
-- `replacement_file` for UTF-8 text read from another regular file.
+- `replacement_file` for UTF-8 text read from a non-empty path to another
+  regular file.
 
 Useful guards and controls are:
 
 | Field | Purpose |
 | --- | --- |
-| `expected_sha256` | Require the selected bytes to match the previous read |
-| `must_contain` | Require one or more strings in the selected bytes |
+| `expected_sha256` | Require the selected bytes to match a non-empty digest from the previous read |
+| `must_contain` | Require one or more non-empty strings in the selected bytes |
 | `include_start` | Replace the start marker line; defaults to `true` |
 | `include_end` | Replace the end marker line; defaults to `false` |
 | `occurrence` | Choose a later one-based start-marker match |
@@ -462,22 +464,37 @@ First run the edit without `--apply`:
 ```
 
 This validates all targets and prints the complete proposed diff without
-changing a file.
+changing a file. Human output includes a `Plan SHA-256:` line. With `--json`,
+the same opaque identifier is returned as `plan_sha256`:
 
-After reviewing that output, apply the same specification:
-
-```text
-"<multi-section-patch>" edit --spec edits.json --apply
+```json
+{
+  "diffs": ["--- current\n+++ proposed\n..."],
+  "changed_files": 2,
+  "plan_sha256": "<64-character-lowercase-sha256>",
+  "applied": false
+}
 ```
 
-The apply command re-reads and revalidates current targets. Add `--backup` when
-independent original-file copies and a manifest are required:
+After reviewing that output, apply the same specification with its exact plan
+identifier:
 
 ```text
-"<multi-section-patch>" edit --spec edits.json --apply --backup
+"<multi-section-patch>" edit --spec edits.json --apply --expect-plan <plan_sha256>
 ```
 
-Pass `--json` to either command for structured output.
+The apply command rebuilds the complete plan and compares its identifier before
+printing a diff, staging files, creating backups, or writing. Any change to a
+target, replacement, permission mode, file identity, resolved range, or final
+content requires a new dry run and review. Add `--backup` when independent
+original-file copies and a manifest are required:
+
+```text
+"<multi-section-patch>" edit --spec edits.json --apply --expect-plan <plan_sha256> --backup
+```
+
+Pass `--json` to either command for structured success output on stdout and
+structured failure output on stderr.
 
 ### PowerShell
 
@@ -499,6 +516,37 @@ Treat every nonzero apply result as requiring review, even when the message
 says completed targets were rolled back. Keep any reported recovery file until
 its target has been verified.
 
+When a recognized `read` or `edit` command includes `--json`, failures emit one
+JSON object on stderr and no success object on stdout:
+
+```json
+{
+  "error": {
+    "code": "invalid_spec",
+    "command": "read",
+    "message": "field \"replacement\" is not valid for read sections",
+    "item_index": 1,
+    "file": "README.md",
+    "field": "replacement"
+  }
+}
+```
+
+`item_index`, `name`, `file`, and `field` appear when known. Error codes are
+stable machine categories:
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_option` | A command option is unknown, malformed, or incompatible |
+| `spec_read_failed` | The JSON specification could not be read |
+| `invalid_spec` | JSON shape, fields, or selector configuration is invalid |
+| `section_resolution_failed` | A read target or selected range could not be resolved |
+| `edit_plan_failed` | An edit target, guard, replacement, or overlap check failed |
+| `plan_mismatch` | The apply plan differs from the reviewed dry run |
+| `apply_failed` | Staging, backup, replacement, rollback, or cleanup failed |
+| `output_failed` | Result output could not be written |
+| `operation_failed` | An otherwise unclassified command failure occurred |
+
 For every option and JSON field, read the bundled
 [CLI reference](skills/multi-section-patch/references/CLI.md).
 
@@ -506,7 +554,10 @@ For every option and JSON field, read the bundled
 
 Multi Section Patch is designed for failure-safe bounded editing:
 
-- **Dry-run first:** `edit` writes nothing unless `--apply` is present.
+- **Review-bound apply:** `edit` writes nothing unless `--apply` carries the
+  exact `--expect-plan` SHA-256 from the reviewed dry run.
+- **Consistent request snapshots:** repeated selectors and replacement-file
+  references reuse the first validated snapshot of each canonical file.
 - **Whole-request validation:** all reads or edits resolve before output or
   writing, so a later invalid target cannot leave a partial read result.
 - **Tight trust boundaries:** target paths, patterns, markers, names,
@@ -587,6 +638,8 @@ does not prevent anyone from forking or extending the project.
 | `exec format error` or equivalent | The wrong OS/architecture executable was selected. Use the platform table above. |
 | `npx skills` cannot create a symlink | Repeat the install command with `--copy`. |
 | A SHA-256 guard fails | The selected bytes changed. Read the section again, review it, and rebuild the edit specification. |
+| `--apply requires --expect-plan` | Run a dry run, review its complete diff, then pass its `plan_sha256` to `--expect-plan`. |
+| The reviewed plan no longer matches | A target, replacement, resolved edit, identity, or permission mode changed. Run and review a new dry run; do not reuse the old identifier. |
 | A marker is missing or ambiguous | Use a JSON specification, tighter markers, `occurrence`, or `end_occurrence`. |
 | A Windows target is read-only | Deliberately remove the read-only attribute before applying, then restore it if required. |
 | A PowerShell quoted path does not run | Prefix the quoted executable path with `&`. |

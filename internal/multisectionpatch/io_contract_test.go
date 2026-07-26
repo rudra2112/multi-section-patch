@@ -74,7 +74,7 @@ func TestEditApplyReturnsFailureWhenStatusOutputFails(t *testing.T) {
 	var stderr bytes.Buffer
 
 	code := Run(
-		[]string{"edit", "--apply"},
+		reviewedApplyArgs(t, spec),
 		strings.NewReader(spec),
 		&failOnWrite{failAt: 2},
 		&stderr,
