@@ -66,6 +66,7 @@ func TestWindowsEditRejectsExclusivelyOpenedTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	applyArgs := reviewedApplyArgs(t, string(spec))
 	path, err := syscall.UTF16PtrFromString(target)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +84,7 @@ func TestWindowsEditRejectsExclusivelyOpenedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := invoke([]string{"edit"}, string(spec))
+	code, stdout, stderr := invoke(applyArgs, string(spec))
 	if err := syscall.CloseHandle(handle); err != nil {
 		t.Fatal(err)
 	}
