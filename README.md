@@ -25,6 +25,58 @@ compiler, package manager, network connection, or background service.
 | Network and telemetry | None during normal `read` or `edit` use |
 | License | [MIT](LICENSE) |
 
+## See it in 30 seconds
+
+![Multi Section Patch demonstration](docs/assets/demo.gif)
+
+Multi Section Patch reads only the requested sections, prepares one complete
+multi-file diff, and writes only when the rebuilt plan matches the reviewed
+SHA-256 identifier.
+
+## Measured example
+
+For the concrete task "read installation guidance and development setup," two
+bounded selectors returned 3,657 bytes of source content from files totaling
+32,364 bytes at [`v0.2.1`](https://github.com/rudra2112/multi-section-patch/tree/v0.2.1),
+or 88.7% fewer UTF-8 source bytes than reading both complete files.
+
+This measures selected source content only. No coding-agent model, tokenizer,
+latency, cost, quality, or total tool-output size was benchmarked. CLI metadata
+is excluded. The measurement was recorded from an LF checkout on 2026-07-26.
+
+<details>
+<summary>Reproduce the measurement</summary>
+
+Use a separate checkout of `v0.2.1` and select the bundled executable for the
+current platform. The tag resolves to commit
+`60141ea266f1f6278cfde64d2285f8e3a5149605`. This POSIX example uses the
+macOS ARM64 executable:
+
+```sh
+git clone --branch v0.2.1 --depth 1 https://github.com/rudra2112/multi-section-patch.git msp-measurement
+cd msp-measurement
+MSP=./skills/multi-section-patch/scripts/multi-section-patch-darwin-arm64
+
+wc -c README.md CONTRIBUTING.md
+"$MSP" read --json \
+  "README.md@/^## Quick start$/../^## Why use Multi Section Patch\?$/" \
+  "CONTRIBUTING.md@/^## Development setup$/../^## Code and documentation$/" \
+  | jq -j '.sections[].content' \
+  | wc -c
+```
+
+Expected totals:
+
+```text
+32364 total
+3657
+```
+
+The pipeline uses `jq` only to concatenate the selected content for counting;
+Multi Section Patch does not require `jq` during normal use.
+
+</details>
+
 ## Quick start
 
 You do not need a marketplace. Agent Skills-compatible coding agents discover
@@ -44,13 +96,13 @@ Preview the files before trusting them:
 gh skill preview rudra2112/multi-section-patch multi-section-patch
 ```
 
-Install for Codex:
+Install for your coding agent:
 
 ```text
-gh skill install rudra2112/multi-section-patch multi-section-patch --agent codex --scope user
+gh skill install rudra2112/multi-section-patch multi-section-patch --agent AGENT_ID --scope user --pin v0.2.2
 ```
 
-Replace `codex` with another supported agent ID:
+Replace `AGENT_ID` with a supported agent ID:
 
 | Agent | ID |
 | --- | --- |
@@ -81,10 +133,10 @@ a convenient project-scoped installation. Run it from the target repository
 root:
 
 ```text
-npx --yes skills@1.5.19 add rudra2112/multi-section-patch --skill multi-section-patch --agent codex --yes
+npx --yes skills@1.5.20 add rudra2112/multi-section-patch --skill multi-section-patch --agent AGENT_ID --yes
 ```
 
-Replace `codex` with an agent ID from the table above. Repeat the command for
+Replace `AGENT_ID` with an agent ID from the table above. Repeat the command for
 another agent, or deliberately use `--agent "*"` to install for every agent
 recognized by the installer.
 
@@ -111,9 +163,9 @@ section and the "Install with npx skills" section from README.md.
 Return the resolved ranges and SHA-256 digests.
 ```
 
-The repository is public and can be installed now. An unpinned remote install
-resolves the latest tagged release when available, then falls back to the
-default branch. Pin a reviewed tag or commit for repeatable installations.
+The GitHub CLI command above pins the reviewed `v0.2.2` release. An unpinned
+remote install resolves the latest tagged release when available, then falls
+back to the default branch.
 
 ## Why use Multi Section Patch?
 
@@ -665,32 +717,48 @@ gh skill update multi-section-patch
 Pinned installations remain on their selected tag or commit until deliberately
 repinned or unpinned.
 
-GitHub CLI currently has no `gh skill remove` or `gh skill list` command. Keep
-the destination printed by `gh skill install`. To uninstall, delete only that
-exact `multi-section-patch` directory, never its shared parent skills
-directory.
-
-Install a reviewed tagged version with:
+List installed skills across all supported agents:
 
 ```text
-gh skill install rudra2112/multi-section-patch multi-section-patch --agent codex --scope user --pin <tag>
+gh skill list --scope user
 ```
+
+Install a reviewed tagged version for your coding agent:
+
+```text
+gh skill install rudra2112/multi-section-patch multi-section-patch --agent AGENT_ID --scope user --pin TAG
+```
+
+Replace `AGENT_ID` with a supported value such as `github-copilot`,
+`claude-code`, `cursor`, `codex`, `gemini-cli`, `opencode`, or `windsurf`.
+Replace `TAG` with a reviewed release tag such as `v0.2.2`. Run
+`gh skill install --help` for the complete current list.
+
+GitHub CLI currently has no documented `gh skill remove` command. To uninstall,
+delete only the exact `multi-section-patch` directory reported by
+`gh skill list` or `gh skill install`, never its shared parent skills directory.
+
+The `--agent` option only selects the host's installation directory; it does
+not make Multi Section Patch agent-specific. `gh skill list --scope user` scans
+all supported hosts rather than filtering to one agent. See the GitHub CLI
+[`install`](https://cli.github.com/manual/gh_skill_install) and
+[`list`](https://cli.github.com/manual/gh_skill_list) documentation.
 
 ### `npx skills` installations
 
 Update a project installation:
 
 ```text
-npx --yes skills@1.5.19 update multi-section-patch --project --yes
+npx --yes skills@1.5.20 update multi-section-patch --project --yes
 ```
 
 Remove it from one agent:
 
 ```text
-npx --yes skills@1.5.19 remove multi-section-patch --agent codex --yes
+npx --yes skills@1.5.20 remove multi-section-patch --agent AGENT_ID --yes
 ```
 
-Replace `codex` with the agent ID used during installation.
+Replace `AGENT_ID` with the agent ID used during installation.
 
 ### Manual installations
 

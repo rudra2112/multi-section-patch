@@ -75,6 +75,10 @@ jobs:
 
   reproducibility:
     name: Reproducible binaries
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     needs: native
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -105,3 +109,10 @@ jobs:
           done < skills/multi-section-patch/SHA256SUMS
       - name: Verify checksums
         run: (cd skills/multi-section-patch && sha256sum --check SHA256SUMS)
+      - name: Attest release binaries and checksums
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: |
+            skills/multi-section-patch/scripts/multi-section-patch-*
+            skills/multi-section-patch/SHA256SUMS
